@@ -1,0 +1,75 @@
+name: Refresh merged PR table
+
+on:
+  schedule:
+    - cron: "17 3 * * *" # 每天刷新一次
+  workflow_dispatch: # 也可在 Actions 页面手动触发
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build table from merged PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh search prs --author yuee3 --merged --limit 200 --json repository,url \
+            --jq '[.[] | {repo: .repository.nameWithOwner, url: .url}]' > prs.json
+          python3 - <<'PY'
+          import collections
+          import json
+          import pathlib
+          import subprocess
+
+          prs = json.load(open('prs.json'))
+          by_repo = collections.defaultdict(list)
+          for p in prs:
+              by_repo[p['repo']].append(p['url'])
+
+          rows = []
+          for repo, urls in by_repo.items():
+              stars = int(subprocess.check_output(
+                  ['gh', 'api', f'repos/{repo}', '--jq', '.stargazers_count']))
+              rows.append((repo, stars,
+                           sorted(urls, key=lambda u: int(u.rsplit('/', 1)[1]))))
+
+          rows.sort(key=lambda r: -r[1])  # 按原仓库 star 从高到低
+          total = sum(len(u) for _, _, u in rows)
+          stars_total = sum(s for _, s, _ in rows)
+
+          lines = [
+              f'共合并 **{total}** 个 PR，覆盖 **{len(rows)}** 个仓库，累计 **{stars_total:,}** ★',
+              '',
+              '| 仓库 | ⭐ | 已合并 PR |',
+              '|---|---|---|',
+          ]
+          for repo, stars, urls in rows:
+              links = ' · '.join(f'[#{u.rsplit("/", 1)[1]}]({u})' for u in urls)
+              lines.append(f'| [{repo}](https://github.com/{repo}) | {stars:,} | {links} |')
+
+          body = '\n'.join(lines)
+          readme = pathlib.Path('README.md')
+          text = readme.read_text(encoding='utf-8')
+          pre, rest = text.split('<!-- PRS:START -->', 1)
+          _, post = rest.split('<!-- PRS:END -->', 1)
+          readme.write_text(
+              pre + '<!-- PRS:START -->\n' + body + '\n<!-- PRS:END -->' + post,
+              encoding='utf-8')
+          PY
+          rm prs.json
+
+      - name: Commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: refresh merged PR table"
+            git push
+          fi
